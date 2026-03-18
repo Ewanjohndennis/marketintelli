@@ -13,3 +13,5 @@ langgraph
 langgraph-supervisor
 streamlit
 python-dotenv
+pytrends
+matplotlib
