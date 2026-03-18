@@ -11,8 +11,8 @@ from datetime import datetime
 
 load_dotenv()
 
-GROQ_API_KEY = st.secrets("GROQ_API_KEY")
-SERP_API_KEY = st.secrets("SERP_API_KEY")
+GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+SERP_API_KEY = st.secrets["SERP_API_KEY"]
 HF_MODEL = "HuggingFaceH4/zephyr-7b-beta"
 
 
