@@ -101,7 +101,6 @@ def call_agent(role: str, message: str) -> str:
         ],
         max_tokens=600,
         temperature=0.4,
-        provider="groq",   # explicitly use Groq
     )
     return response.choices[0].message.content.strip()
 

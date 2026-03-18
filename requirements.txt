@@ -2,7 +2,7 @@ streamlit
 plotly
 pandas
 yfinance
-huggingface_hub
+huggingface_hub>=0.23.0
 google-search-results
 python-dotenv
 matplotlib
