@@ -11,8 +11,8 @@ from datetime import datetime
 
 load_dotenv()
 
-HF_TOKEN     = os.getenv("HF_TOKEN")
-SERP_API_KEY = os.getenv("SERP_API_KEY")
+HF_TOKEN     = st.secrets["HF_TOKEN"]
+SERP_API_KEY = st.secrets["SERP_API_KEY"]
 HF_MODEL     = "HuggingFaceH4/zephyr-7b-beta"
 
 client = InferenceClient(model=HF_MODEL, token=HF_TOKEN)
