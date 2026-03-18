@@ -13,7 +13,7 @@ load_dotenv()
 
 HF_TOKEN     = st.secrets["HF_TOKEN"]
 SERP_API_KEY = st.secrets["SERP_API_KEY"]
-HF_MODEL     = "microsoft/Phi-3-mini-4k-instruct"
+HF_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
 
 client = InferenceClient(model=HF_MODEL, token=HF_TOKEN)
@@ -101,6 +101,7 @@ def call_agent(role: str, message: str) -> str:
         ],
         max_tokens=600,
         temperature=0.4,
+        provider="groq",   # explicitly use Groq
     )
     return response.choices[0].message.content.strip()
 
