@@ -6,17 +6,17 @@ import yfinance as yf
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 from serpapi import GoogleSearch
-from huggingface_hub import InferenceClient
+from groq import Groq
 from datetime import datetime
 
 load_dotenv()
 
-HF_TOKEN     = st.secrets["HF_TOKEN"]
-SERP_API_KEY = st.secrets["SERP_API_KEY"]
-HF_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+GROQ_API_KEY = st.secrets("GROQ_API_KEY")
+SERP_API_KEY = st.secrets("SERP_API_KEY")
+HF_MODEL = "HuggingFaceH4/zephyr-7b-beta"
 
 
-client = InferenceClient(model=HF_MODEL, token=HF_TOKEN)
+client = Groq(api_key=GROQ_API_KEY)
 
 COLORS = [
     ("#4F8EF7", "rgba(79,142,247,0.12)"),
@@ -93,8 +93,10 @@ AGENTS = {
         "Be sharp and data-driven. Use bullet points.",
 }
 
+# Update call_agent:
 def call_agent(role: str, message: str) -> str:
-    response = client.chat_completion(
+    response = client.chat.completions.create(
+        model="llama-3.1-8b-instant",
         messages=[
             {"role": "system", "content": AGENTS[role]},
             {"role": "user",   "content": message},
@@ -103,7 +105,6 @@ def call_agent(role: str, message: str) -> str:
         temperature=0.4,
     )
     return response.choices[0].message.content.strip()
-
 # ── Data fetchers ──────────────────────────────────────────────────────────────
 def fetch_trend(keyword: str) -> pd.DataFrame:
     try:
