@@ -13,7 +13,7 @@ load_dotenv()
 
 HF_TOKEN     = st.secrets["HF_TOKEN"]
 SERP_API_KEY = st.secrets["SERP_API_KEY"]
-HF_MODEL     = "HuggingFaceH4/zephyr-7b-beta"
+HF_MODEL     = "mistralai/Mistral-7B-Instruct-v0.3"
 
 client = InferenceClient(model=HF_MODEL, token=HF_TOKEN)
 
