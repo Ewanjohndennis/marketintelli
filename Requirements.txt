@@ -5,3 +5,4 @@ yfinance
 huggingface_hub
 google-search-results
 python-dotenv
+matplotlib
