@@ -1,22 +1,29 @@
-import os, json
+import io, json, os, time
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 from concurrent.futures import ThreadPoolExecutor
-from dotenv import load_dotenv
 from serpapi import GoogleSearch
 from groq import Groq
 from datetime import datetime
-
+from pymongo import MongoClient
+from dotenv import load_dotenv
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.lib import colors
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table,
+    TableStyle, HRFlowable, PageBreak,
+)
 load_dotenv()
-
+# ── Config ─────────────────────────────────────────────────────────────────────
 GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 SERP_API_KEY = st.secrets["SERP_API_KEY"]
-HF_MODEL = "HuggingFaceH4/zephyr-7b-beta"
+MONGO_URI    = st.secrets["MONGO_URI"]
 
-
-client = Groq(api_key=GROQ_API_KEY)
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 COLORS = [
     ("#4F8EF7", "rgba(79,142,247,0.12)"),
@@ -26,32 +33,130 @@ COLORS = [
     ("#9B59B6", "rgba(155,89,182,0.12)"),
 ]
 
-# ── Ticker resolver ────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# MongoDB connection
+# ══════════════════════════════════════════════════════════════════════════════
+@st.cache_resource
+def get_db():
+    """Cached MongoDB connection — reused across all user sessions."""
+    client = MongoClient(MONGO_URI)
+    return client["market_intelligence"]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. AUTHENTICATION
+# ══════════════════════════════════════════════════════════════════════════════
+USERS = {
+    "admin":    {"password": "admin", "role": "admin"},
+    "employee": {"password": "1234",  "role": "employee"},
+}
+
+def show_login():
+    """Show login screen — blocks until authenticated."""
+    st.title("🧠 Company Intelligence Dashboard")
+    st.divider()
+    col1, col2, col3 = st.columns([1, 1.2, 1])
+    with col2:
+        st.subheader("Sign In")
+        user_id  = st.text_input("User ID", placeholder="employee or admin")
+        password = st.text_input("Password", type="password")
+        if st.button("Login", type="primary", use_container_width=True):
+            user = USERS.get(user_id.strip())
+            if user and user["password"] == password.strip():
+                st.session_state["logged_in"] = True
+                st.session_state["user_id"]   = user_id.strip()
+                st.session_state["role"]      = user["role"]
+                st.rerun()
+            else:
+                st.error("Invalid user ID or password.")
+    return False
+
+def is_admin() -> bool:
+    return st.session_state.get("role") == "admin"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Shared settings — stored in MongoDB, visible to ALL users instantly
+# ══════════════════════════════════════════════════════════════════════════════
+CONFIG_DOC_ID = "global_company_config"
+
+def load_settings() -> dict:
+    """
+    Read company config from MongoDB.
+    Always fetches fresh from DB so employees see admin changes immediately.
+    """
+    try:
+        db  = get_db()
+        doc = db["config"].find_one({"_id": CONFIG_DOC_ID})
+        if doc:
+            return {
+                "company_name":     doc.get("company_name", ""),
+                "company_ticker":   doc.get("company_ticker", ""),
+                "competitors":      doc.get("competitors", []),
+                "auto_competitors": doc.get("auto_competitors", True),
+            }
+    except Exception:
+        pass
+    return {
+        "company_name":     "",
+        "company_ticker":   "",
+        "competitors":      [],
+        "auto_competitors": True,
+    }
+
+def save_settings(s: dict):
+    """
+    Write company config to MongoDB.
+    Uses upsert — creates on first save, updates on subsequent saves.
+    All employees read this fresh on every page load.
+    """
+    try:
+        db = get_db()
+        db["config"].update_one(
+            {"_id": CONFIG_DOC_ID},
+            {"$set": {
+                "company_name":     s["company_name"],
+                "company_ticker":   s["company_ticker"],
+                "competitors":      s["competitors"],
+                "auto_competitors": s["auto_competitors"],
+                "updated_at":       datetime.utcnow(),
+                "updated_by":       st.session_state.get("user_id", "admin"),
+            }},
+            upsert=True,
+        )
+    except Exception as e:
+        st.error(f"Failed to save settings to MongoDB: {e}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. AUTO TICKER RESOLUTION
+# ══════════════════════════════════════════════════════════════════════════════
 KNOWN_TICKERS = {
     "apple": "AAPL", "samsung": "005930.KS", "google": "GOOGL",
     "alphabet": "GOOGL", "microsoft": "MSFT", "amazon": "AMZN",
     "meta": "META", "facebook": "META", "tesla": "TSLA",
     "nvidia": "NVDA", "nike": "NKE", "adidas": "ADDYY",
-    "puma": "PUMSY", "sony": "SONY", "lg": "066570.KS",
-    "intel": "INTC", "amd": "AMD", "qualcomm": "QCOM",
-    "netflix": "NFLX", "spotify": "SPOT", "uber": "UBER",
-    "airbnb": "ABNB", "coca cola": "KO", "pepsi": "PEP",
-    "pepsico": "PEP", "walmart": "WMT", "target": "TGT",
-    "disney": "DIS", "ford": "F", "gm": "GM", "toyota": "TM",
-    "bmw": "BMWYY", "mercedes": "MBGYY", "volkswagen": "VWAGY",
-    "pfizer": "PFE", "jpmorgan": "JPM", "goldman sachs": "GS",
+    "puma": "PUMSY", "sony": "SONY", "intel": "INTC",
+    "amd": "AMD", "netflix": "NFLX", "spotify": "SPOT",
+    "uber": "UBER", "airbnb": "ABNB", "coca cola": "KO",
+    "pepsi": "PEP", "walmart": "WMT", "disney": "DIS",
+    "ford": "F", "toyota": "TM", "jpmorgan": "JPM",
+    "tata": "TATAMOTORS.NS", "infosys": "INFY", "wipro": "WIT",
+    "reliance": "RELIANCE.NS", "hdfc": "HDFCBANK.NS",
 }
 
 def resolve_ticker(keyword: str) -> str | None:
+    """Auto-resolve company name to stock ticker — no manual input needed."""
     key = keyword.lower().strip()
     if key in KNOWN_TICKERS:
         return KNOWN_TICKERS[key]
+    # Try yfinance search
     try:
         results = yf.Search(keyword, max_results=1).quotes
         if results:
-            return results[0].get("symbol")
+            sym = results[0].get("symbol")
+            if sym:
+                return sym
     except Exception:
         pass
+    # Try as raw ticker
     try:
         t = yf.Ticker(keyword.upper())
         if t.info.get("regularMarketPrice") or t.info.get("currentPrice"):
@@ -60,52 +165,80 @@ def resolve_ticker(keyword: str) -> str | None:
         pass
     return None
 
-# ── Agent prompts ──────────────────────────────────────────────────────────────
+def auto_detect_competitors(company_name: str) -> list:
+    import time
+    for attempt in range(3):
+        try:
+            response = groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content":
+                        "Return ONLY a JSON array of exactly 4 top competitor company names. "
+                        "No explanation, no markdown, just the JSON array."},
+                    {"role": "user", "content": f"Top 4 competitors of {company_name}"}
+                ],
+                max_tokens=100, temperature=0.3,
+            )
+            raw     = response.choices[0].message.content.strip()
+            cleaned = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            return json.loads(cleaned)
+        except Exception:
+            time.sleep(2 ** attempt)
+    return []
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Agent prompts
+# ══════════════════════════════════════════════════════════════════════════════
 AGENTS = {
-    "trend":
-        "You are TrendAgent. Analyse the Google search trend data statistically. "
-        "Identify momentum shifts, peaks, dips, and growth/decline signals. "
-        "Be concise — 2 short paragraphs.",
-    "sentiment":
-        "You are SentimentAgent. Analyse the news headlines provided. "
-        "Determine overall sentiment (positive/neutral/negative) for each entity. "
-        "Highlight reputational risks or opportunities. 2 short paragraphs.",
-    "competitor":
-        "You are CompetitorAgent. Based on trend data and news headlines, "
-        "compare relative positioning of the entities. "
-        "Who is gaining, who is losing, and why? 2 short paragraphs.",
-    "forecast":
-        "You are ForecastAgent. Based on trend momentum and news signals, "
-        "predict the next-quarter outlook for each entity. "
-        "Be directional (e.g. 'up ~10%'). 2 short paragraphs.",
+    "news_analyst":
+        "You are NewsAnalyst for an internal company intelligence system. "
+        "Analyse the latest news headlines. Summarise key developments, risks, "
+        "and opportunities in 2 short paragraphs. Be direct and actionable.",
+    "competitor_analyst":
+        "You are CompetitorAnalyst. Compare the company against its competitors "
+        "based on search trends and news. Who is gaining ground? Who is losing? "
+        "What are the key differentiators? 2 short paragraphs.",
+    "financial_analyst":
+        "You are FinancialAnalyst. Analyse the stock performance and revenue data. "
+        "Identify growth trends, risks, and financial health signals. "
+        "Be concise and data-driven. 2 short paragraphs.",
+    "improvement_analyst":
+        "You are StrategicAdvisor. Based on the news, competitor positioning, "
+        "trends, and financials, identify 5 specific actionable improvements. "
+        "Format as a numbered list. Be direct and specific.",
     "synthesizer":
-        "You are the Synthesizer of a real-time market intelligence system. "
-        "Merge all agent outputs into a structured final intelligence brief:\n"
-        "1. Trend Summary\n2. Sentiment & Reputation\n"
-        "3. Competitive Positioning\n4. Outlook & Recommendations\n"
-        "Be sharp, actionable. Use bullet points within each section.",
-    "sales_analyst":
-        "You are SalesAnalyst. Given financial data for publicly listed companies, "
-        "produce a structured sales intelligence brief:\n"
-        "1. Revenue Trend\n2. Stock Performance & Market Sentiment\n"
-        "3. Pricing Signal Analysis\n4. Market Share Estimate\n"
-        "5. Sales Outlook for next quarter\n"
-        "Be sharp and data-driven. Use bullet points.",
+        "You are the Chief Intelligence Officer. Merge all analyst inputs into "
+        "an executive brief with these sections:\n"
+        "1. Company Pulse\n2. Competitive Position\n3. Financial Health\n"
+        "4. Key Risks\n5. Strategic Recommendations\n"
+        "Be sharp, concise, and executive-ready. Use bullet points.",
 }
 
-# Update call_agent:
-def call_agent(role: str, message: str) -> str:
-    response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[
-            {"role": "system", "content": AGENTS[role]},
-            {"role": "user",   "content": message},
-        ],
-        max_tokens=600,
-        temperature=0.4,
-    )
-    return response.choices[0].message.content.strip()
-# ── Data fetchers ──────────────────────────────────────────────────────────────
+def call_agent(role: str, message: str, retries: int = 3) -> str:
+    """Call Groq with automatic retry on transient connection errors."""
+    import time
+    last_err = None
+    for attempt in range(retries):
+        try:
+            response = groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": AGENTS[role]},
+                    {"role": "user",   "content": message},
+                ],
+                max_tokens=600, temperature=0.4,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            last_err = e
+            wait = 2 ** attempt  # 1s, 2s, 4s backoff
+            time.sleep(wait)
+    # All retries failed — return a safe fallback message
+    return f"[Analysis unavailable — Groq connection error after {retries} retries: {str(last_err)[:120]}]"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Data fetchers
+# ══════════════════════════════════════════════════════════════════════════════
 def fetch_trend(keyword: str) -> pd.DataFrame:
     try:
         data = GoogleSearch({
@@ -121,7 +254,7 @@ def fetch_trend(keyword: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-def fetch_news(keyword: str, num: int = 5) -> list:
+def fetch_news(keyword: str, num: int = 6) -> list:
     try:
         data = GoogleSearch({
             "engine": "google", "q": f"{keyword} news",
@@ -173,29 +306,18 @@ def fetch_financials(ticker: str) -> dict:
             "52w_low":           info.get("fiftyTwoWeekLow", 0),
             "current_price":     info.get("currentPrice", 0),
             "revenue_quarterly": revenue_series,
+            "debt_to_equity":    info.get("debtToEquity", 0),
+            "return_on_equity":  info.get("returnOnEquity", 0),
+            "operating_margin":  info.get("operatingMargins", 0),
+            "eps":               info.get("trailingEps", 0),
+            "dividend_yield":    info.get("dividendYield", 0),
         }
     except Exception:
         return {}
 
-def fetch_pricing(keyword: str) -> list:
-    try:
-        data = GoogleSearch({
-            "engine": "google_shopping", "q": keyword,
-            "num": 5, "api_key": SERP_API_KEY,
-        }).get_dict()
-        return [
-            {
-                "title":  r.get("title", ""),
-                "price":  r.get("price", "N/A"),
-                "source": r.get("source", ""),
-                "link":   r.get("link", ""),
-            }
-            for r in data.get("shopping_results", [])
-        ]
-    except Exception:
-        return []
-
-# ── Chart builders ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Chart builders
+# ══════════════════════════════════════════════════════════════════════════════
 def build_trend_chart(keywords, dataframes):
     fig = go.Figure()
     for i, (keyword, df) in enumerate(zip(keywords, dataframes)):
@@ -216,10 +338,10 @@ def build_trend_chart(keywords, dataframes):
             textfont=dict(color=color), showlegend=False, hoverinfo="skip",
         ))
     fig.update_layout(
-        hovermode="x unified", height=400,
+        hovermode="x unified", height=360,
         plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
         xaxis=dict(showgrid=False, tickangle=-40, tickfont=dict(size=10)),
-        yaxis=dict(title="Interest (0–100)", gridcolor="rgba(180,180,180,0.15)"),
+        yaxis=dict(title="Interest (0-100)", gridcolor="rgba(180,180,180,0.15)"),
         legend=dict(orientation="h", y=1.05),
         margin=dict(l=50, r=20, t=40, b=50),
     )
@@ -237,7 +359,7 @@ def build_stock_chart(tickers, stock_dfs):
             hovertemplate="%{x} — <b>$%{y}</b><extra>" + ticker + "</extra>",
         ))
     fig.update_layout(
-        hovermode="x unified", height=380,
+        hovermode="x unified", height=340,
         plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
         xaxis=dict(showgrid=False, tickangle=-40, tickfont=dict(size=10)),
         yaxis=dict(title="Stock Price (USD)", gridcolor="rgba(180,180,180,0.15)"),
@@ -261,7 +383,7 @@ def build_revenue_chart(tickers, financials):
             marker_color=color, opacity=0.85,
         ))
     fig.update_layout(
-        barmode="group", height=350,
+        barmode="group", height=300,
         plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
         xaxis=dict(showgrid=False, tickangle=-40, tickfont=dict(size=10)),
         yaxis=dict(title="Revenue ($M)", gridcolor="rgba(180,180,180,0.15)"),
@@ -270,220 +392,508 @@ def build_revenue_chart(tickers, financials):
     )
     return fig
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# App UI
+# 3. FINANCIAL COMPARISON TABLE
 # ══════════════════════════════════════════════════════════════════════════════
-st.set_page_config(page_title="Real-Time Market Intelligence", page_icon="🧠", layout="wide")
-st.title("🧠 Real-Time Market Intelligence")
-st.caption("Track brands, products, and markets — powered by Google Trends, live news, financial data, and AI agents.")
-st.divider()
+def render_financial_comparison(ticker_map: dict, financials: dict):
+    """Side-by-side financial metrics comparison table."""
+    st.subheader("📊 Financial Metrics Comparison")
 
-track_type = st.radio(
-    "What are you tracking?",
-    ["Brand", "Product", "Market / Category", "Custom"],
-    horizontal=True,
-)
-placeholders = {
-    "Brand":             "e.g. Apple, Samsung, Sony",
-    "Product":           "e.g. iPhone 15, Galaxy S24",
-    "Market / Category": "e.g. Electric Vehicles, Cloud Computing",
-    "Custom":            "Enter any keywords",
-}
-raw_input  = st.text_input(f"Enter keywords ({track_type})", placeholder=placeholders[track_type])
-news_count = st.slider("News articles per keyword", 3, 10, 5)
+    companies = list(ticker_map.keys())
+    tickers   = list(ticker_map.values())
 
-if st.button("🚀 Run Full Intelligence Report", type="primary"):
-    keywords = [k.strip() for k in raw_input.split(",") if k.strip()]
-    if not keywords:
-        st.warning("Please enter at least one keyword.")
-        st.stop()
-    if len(keywords) > 5:
-        st.warning("Please enter at most 5 keywords.")
-        st.stop()
-
-    # ── Step 1: Resolve tickers ────────────────────────────────────────────
-    with st.spinner("Resolving stock tickers…"):
-        ticker_map = {}
-        for kw in keywords:
-            t = resolve_ticker(kw)
-            if t:
-                ticker_map[kw] = t
-
-    if ticker_map:
-        st.success("Tickers resolved: " +
-                   ", ".join([f"**{kw}** → `{t}`" for kw, t in ticker_map.items()]))
-
-    # ── Step 2: Fetch ALL data in parallel ────────────────────────────────
-    with st.spinner("⚡ Fetching all data in parallel…"):
-        with ThreadPoolExecutor(max_workers=12) as ex:
-            # Submit all fetches, keyed by index/name for safe retrieval
-            trend_futures   = [(kw, ex.submit(fetch_trend, kw))   for kw in keywords]
-            news_futures    = [(kw, ex.submit(fetch_news, kw, news_count)) for kw in keywords]
-            stock_futures   = [(t,  ex.submit(fetch_stock_price, t)) for t in ticker_map.values()]
-            fin_futures     = [(t,  ex.submit(fetch_financials, t))  for t in ticker_map.values()]
-            pricing_futures = [(kw, ex.submit(fetch_pricing, kw))  for kw in keywords]
-
-            # Collect results safely — no DataFrames used as dict keys
-            dataframes_list = [f.result() for _, f in trend_futures]
-            news_data       = {kw: f.result() for kw, f in news_futures}
-            stock_dfs       = {t:  f.result() for t,  f in stock_futures}
-            financials      = {t:  f.result() for t,  f in fin_futures}
-            pricing         = {kw: f.result() for kw, f in pricing_futures}
-
-    # ── Step 3: Build agent inputs ─────────────────────────────────────────
-    trend_lines = [
-        f"{kw}: avg={df['value'].mean():.1f}, peak={df['value'].max()}, "
-        f"series={df['value'].astype(int).tolist()}"
-        for kw, df in zip(keywords, dataframes_list) if not df.empty
+    metrics = [
+        ("Current Price",    "current_price",   lambda v: f"${v:.2f}"),
+        ("Market Cap",       "market_cap",       lambda v: f"${v/1e9:.1f}B"),
+        ("TTM Revenue",      "revenue_ttm",      lambda v: f"${v/1e9:.1f}B"),
+        ("Gross Margin",     "gross_margin",     lambda v: f"{v*100:.1f}%"),
+        ("Operating Margin", "operating_margin", lambda v: f"{v*100:.1f}%"),
+        ("P/E Ratio",        "pe_ratio",         lambda v: f"{v:.1f}x"),
+        ("EPS",              "eps",              lambda v: f"${v:.2f}"),
+        ("Return on Equity", "return_on_equity", lambda v: f"{v*100:.1f}%"),
+        ("Debt / Equity",    "debt_to_equity",   lambda v: f"{v:.2f}"),
+        ("Dividend Yield",   "dividend_yield",   lambda v: f"{v*100:.2f}%" if v else "N/A"),
+        ("52W High",         "52w_high",         lambda v: f"${v:.2f}"),
+        ("52W Low",          "52w_low",          lambda v: f"${v:.2f}"),
     ]
-    news_lines = [
-        f"{kw}: {' | '.join([a['title'] for a in articles[:5]])}"
-        for kw, articles in news_data.items()
-    ]
-    trend_summary = "\n".join(trend_lines)
-    news_summary  = "\n".join(news_lines)
-    combined      = f"TREND DATA:\n{trend_summary}\n\nNEWS HEADLINES:\n{news_summary}"
 
-    fin_lines = []
-    for kw, ticker in ticker_map.items():
-        fin   = financials.get(ticker, {})
-        rev_q = fin.get("revenue_quarterly", {})
-        rev_str = ", ".join([f"{d}: ${v}M" for d, v in sorted(rev_q.items())])
-        fin_lines.append(
-            f"{fin.get('company_name', kw)} ({ticker}):\n"
-            f"  Market Cap: ${fin.get('market_cap',0)/1e9:.1f}B\n"
-            f"  TTM Revenue: ${fin.get('revenue_ttm',0)/1e9:.1f}B\n"
-            f"  Gross Margin: {fin.get('gross_margin',0)*100:.1f}%\n"
-            f"  P/E Ratio: {fin.get('pe_ratio',0):.1f}\n"
-            f"  52W High/Low: ${fin.get('52w_high',0):.2f} / ${fin.get('52w_low',0):.2f}\n"
-            f"  Current Price: ${fin.get('current_price',0):.2f}\n"
-            f"  Quarterly Revenue: {rev_str}"
-        )
-    pricing_lines = [
-        f"{kw}: {', '.join([p['price'] for p in items if p['price'] != 'N/A'][:5])}"
-        for kw, items in pricing.items()
-    ]
-    sales_input = (
-        "FINANCIAL DATA:\n" + "\n\n".join(fin_lines) +
-        "\n\nPRICING SIGNALS:\n" + "\n".join(pricing_lines)
+    # Build comparison dataframe
+    rows = {}
+    for label, key, fmt in metrics:
+        row = {}
+        for company, ticker in ticker_map.items():
+            fin = financials.get(ticker, {})
+            val = fin.get(key, 0)
+            try:
+                row[company] = fmt(val) if val else "N/A"
+            except Exception:
+                row[company] = "N/A"
+        rows[label] = row
+
+    df = pd.DataFrame(rows).T
+    df.index.name = "Metric"
+    st.dataframe(df, use_container_width=True)
+
+    # Bar chart comparison for key metrics
+    st.subheader("📈 Key Metrics — Visual Comparison")
+    metric_choice = st.selectbox(
+        "Select metric to compare",
+        ["Market Cap ($B)", "TTM Revenue ($B)", "Gross Margin (%)",
+         "P/E Ratio", "Return on Equity (%)", "Operating Margin (%)"],
     )
 
-    # ── Step 4: Run ALL agents in parallel ────────────────────────────────
-    with st.spinner("🤖 Running all AI agents in parallel…"):
-        with ThreadPoolExecutor(max_workers=5) as ex:
-            f_trend      = ex.submit(call_agent, "trend",         f"Analyse trends.\n\n{trend_summary}")
-            f_sentiment  = ex.submit(call_agent, "sentiment",     f"Analyse sentiment.\n\n{news_summary}")
-            f_competitor = ex.submit(call_agent, "competitor",    f"Compare positioning.\n\n{combined}")
-            f_forecast   = ex.submit(call_agent, "forecast",      f"Forecast outlook.\n\n{combined}")
-            f_sales      = ex.submit(call_agent, "sales_analyst", sales_input)
+    metric_map = {
+        "Market Cap ($B)":       ("market_cap",       lambda v: v / 1e9),
+        "TTM Revenue ($B)":      ("revenue_ttm",       lambda v: v / 1e9),
+        "Gross Margin (%)":      ("gross_margin",      lambda v: v * 100),
+        "P/E Ratio":             ("pe_ratio",          lambda v: v),
+        "Return on Equity (%)":  ("return_on_equity",  lambda v: v * 100),
+        "Operating Margin (%)":  ("operating_margin",  lambda v: v * 100),
+    }
 
-            trend_out      = f_trend.result()
-            sentiment_out  = f_sentiment.result()
-            competitor_out = f_competitor.result()
-            forecast_out   = f_forecast.result()
-            sales_brief    = f_sales.result()
+    key, transform = metric_map[metric_choice]
+    bar_fig = go.Figure()
+    for i, (company, ticker) in enumerate(ticker_map.items()):
+        fin = financials.get(ticker, {})
+        val = fin.get(key, 0)
+        color, _ = COLORS[i % len(COLORS)]
+        bar_fig.add_trace(go.Bar(
+            x=[company], y=[transform(val) if val else 0],
+            name=company, marker_color=color,
+        ))
+    bar_fig.update_layout(
+        height=320, barmode="group",
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        yaxis=dict(title=metric_choice, gridcolor="rgba(180,180,180,0.15)"),
+        xaxis=dict(showgrid=False),
+        showlegend=False,
+        margin=dict(l=50, r=20, t=20, b=40),
+    )
+    st.plotly_chart(bar_fig, use_container_width=True)
 
-    # Synthesizer runs last — needs the 4 agent outputs above
-    with st.spinner("🧠 Synthesizing final brief…"):
-        brief = call_agent(
-            "synthesizer",
-            f"TrendAgent:\n{trend_out}\n\nSentimentAgent:\n{sentiment_out}\n\n"
-            f"CompetitorAgent:\n{competitor_out}\n\nForecastAgent:\n{forecast_out}",
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. PDF REPORT GENERATOR
+# ══════════════════════════════════════════════════════════════════════════════
+def generate_pdf(company: str, competitors: list, brief: str,
+                 news_out: str, comp_out: str, fin_out: str,
+                 improve_out: str, financials: dict,
+                 ticker_map: dict, generated_at: str) -> bytes:
+    """Generate a professional PDF report using reportlab."""
+    buffer = io.BytesIO()
+    doc    = SimpleDocTemplate(
+        buffer, pagesize=letter,
+        leftMargin=0.75*inch, rightMargin=0.75*inch,
+        topMargin=0.75*inch, bottomMargin=0.75*inch,
+    )
+
+    styles  = getSampleStyleSheet()
+    story   = []
+
+    # Custom styles
+    title_style = ParagraphStyle(
+        "ReportTitle",
+        parent=styles["Title"],
+        fontSize=22, spaceAfter=6, textColor=colors.HexColor("#1a1a2e"),
+    )
+    h1_style = ParagraphStyle(
+        "H1", parent=styles["Heading1"],
+        fontSize=14, spaceAfter=4, spaceBefore=12,
+        textColor=colors.HexColor("#185FA5"),
+    )
+    h2_style = ParagraphStyle(
+        "H2", parent=styles["Heading2"],
+        fontSize=11, spaceAfter=4, spaceBefore=8,
+        textColor=colors.HexColor("#333333"),
+    )
+    body_style = ParagraphStyle(
+        "Body", parent=styles["Normal"],
+        fontSize=10, spaceAfter=6, leading=15,
+    )
+    caption_style = ParagraphStyle(
+        "Caption", parent=styles["Normal"],
+        fontSize=9, textColor=colors.HexColor("#666666"),
+        spaceAfter=12,
+    )
+
+    def add_section(title, content):
+        story.append(Paragraph(title, h1_style))
+        story.append(HRFlowable(width="100%", thickness=0.5,
+                                color=colors.HexColor("#185FA5")))
+        story.append(Spacer(1, 6))
+        for line in content.split("\n"):
+            line = line.strip()
+            if line:
+                story.append(Paragraph(line, body_style))
+        story.append(Spacer(1, 10))
+
+    # ── Cover ──────────────────────────────────────────────────────────────────
+    story.append(Spacer(1, 0.5*inch))
+    story.append(Paragraph(f"{company}", title_style))
+    story.append(Paragraph("Intelligence Report", styles["Heading2"]))
+    story.append(Spacer(1, 6))
+    story.append(Paragraph(f"Generated: {generated_at}", caption_style))
+    if competitors:
+        story.append(Paragraph(
+            f"Benchmarked against: {', '.join(competitors)}", caption_style))
+    story.append(HRFlowable(width="100%", thickness=1,
+                            color=colors.HexColor("#185FA5")))
+    story.append(Spacer(1, 0.2*inch))
+
+    # ── Executive Brief ────────────────────────────────────────────────────────
+    add_section("Executive Brief", brief)
+    story.append(PageBreak())
+
+    # ── Financial Comparison Table ─────────────────────────────────────────────
+    story.append(Paragraph("Financial Metrics", h1_style))
+    story.append(HRFlowable(width="100%", thickness=0.5,
+                            color=colors.HexColor("#185FA5")))
+    story.append(Spacer(1, 8))
+
+    metrics = [
+        ("Current Price",    "current_price",   lambda v: f"${v:.2f}"),
+        ("Market Cap",       "market_cap",       lambda v: f"${v/1e9:.1f}B"),
+        ("TTM Revenue",      "revenue_ttm",      lambda v: f"${v/1e9:.1f}B"),
+        ("Gross Margin",     "gross_margin",     lambda v: f"{v*100:.1f}%"),
+        ("Operating Margin", "operating_margin", lambda v: f"{v*100:.1f}%"),
+        ("P/E Ratio",        "pe_ratio",         lambda v: f"{v:.1f}x"),
+        ("EPS",              "eps",              lambda v: f"${v:.2f}"),
+        ("Return on Equity", "return_on_equity", lambda v: f"{v*100:.1f}%"),
+        ("52W High",         "52w_high",         lambda v: f"${v:.2f}"),
+        ("52W Low",          "52w_low",          lambda v: f"${v:.2f}"),
+    ]
+
+    company_list = list(ticker_map.keys())
+    header_row   = ["Metric"] + company_list
+    table_data   = [header_row]
+
+    for label, key, fmt in metrics:
+        row = [label]
+        for comp in company_list:
+            ticker = ticker_map.get(comp, "")
+            fin    = financials.get(ticker, {})
+            val    = fin.get(key, 0)
+            try:
+                row.append(fmt(val) if val else "N/A")
+            except Exception:
+                row.append("N/A")
+        table_data.append(row)
+
+    col_width = (6.5 * inch) / len(header_row)
+    tbl = Table(table_data, colWidths=[col_width] * len(header_row))
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND",  (0, 0), (-1, 0),  colors.HexColor("#185FA5")),
+        ("TEXTCOLOR",   (0, 0), (-1, 0),  colors.white),
+        ("FONTNAME",    (0, 0), (-1, 0),  "Helvetica-Bold"),
+        ("FONTSIZE",    (0, 0), (-1, 0),  10),
+        ("ALIGN",       (0, 0), (-1, -1), "CENTER"),
+        ("FONTSIZE",    (0, 1), (-1, -1), 9),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+         [colors.HexColor("#f5f8ff"), colors.white]),
+        ("GRID",        (0, 0), (-1, -1), 0.3, colors.HexColor("#cccccc")),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING",   (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 5),
+        ("FONTNAME",    (0, 1), (0, -1), "Helvetica-Bold"),
+    ]))
+    story.append(tbl)
+    story.append(Spacer(1, 16))
+    story.append(PageBreak())
+
+    # ── Analysis sections ──────────────────────────────────────────────────────
+    add_section("News & Sentiment Analysis", news_out)
+    add_section("Competitor Analysis",       comp_out)
+    add_section("Financial Analysis",        fin_out)
+    story.append(PageBreak())
+    add_section("Strategic Recommendations — What to Improve", improve_out)
+
+    # ── Footer note ────────────────────────────────────────────────────────────
+    story.append(Spacer(1, 0.3*inch))
+    story.append(HRFlowable(width="100%", thickness=0.5,
+                            color=colors.HexColor("#cccccc")))
+    story.append(Paragraph(
+        "This report was auto-generated by the Company Intelligence Dashboard. "
+        "Data sourced from Google Trends, Google News, and Yahoo Finance.",
+        caption_style,
+    ))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.read()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Main dashboard renderer
+# ══════════════════════════════════════════════════════════════════════════════
+def render_dashboard(settings: dict):
+    company      = settings["company_name"]
+    competitors  = settings["competitors"]
+    all_keywords = [company] + competitors
+    ticker_map   = {}
+
+    # Auto-resolve all tickers
+    with st.spinner("Resolving tickers automatically…"):
+        t = resolve_ticker(company)
+        if t:
+            ticker_map[company] = t
+        for comp in competitors:
+            t = resolve_ticker(comp)
+            if t:
+                ticker_map[comp] = t
+
+    if ticker_map:
+        st.sidebar.success(
+            "Tickers: " + ", ".join([f"{k} → `{v}`" for k, v in ticker_map.items()])
         )
 
-    # ── Step 5: Render both tabs with all results ready ────────────────────
-    tab_trend, tab_sales = st.tabs(["📊 Trend & News Intelligence", "💰 Sales Intelligence"])
+    # Fetch all data in parallel
+    with st.spinner("Gathering intelligence…"):
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            trend_futures     = [(kw, ex.submit(fetch_trend, kw)) for kw in all_keywords]
+            news_future       = ex.submit(fetch_news, company, 6)
+            comp_news_futures = [(c,  ex.submit(fetch_news, c, 3)) for c in competitors]
+            stock_futures     = [(t,  ex.submit(fetch_stock_price, t)) for t in ticker_map.values()]
+            fin_futures       = [(t,  ex.submit(fetch_financials, t)) for t in ticker_map.values()]
 
-    with tab_trend:
-        st.subheader("📈 Search Interest (Last 12 Months)")
-        if any(not df.empty for df in dataframes_list):
-            st.plotly_chart(build_trend_chart(keywords, dataframes_list), use_container_width=True)
-            cols = st.columns(len(keywords) * 2)
-            for i, (kw, df) in enumerate(zip(keywords, dataframes_list)):
-                if not df.empty:
-                    cols[i * 2].metric(f"{kw} avg",  int(df["value"].mean()))
-                    cols[i * 2 + 1].metric(f"{kw} peak", int(df["value"].max()))
-        else:
-            st.error("No trend data returned. Check your SERP_API_KEY.")
+            trend_dfs    = {kw: f.result() for kw, f in trend_futures}
+            company_news = news_future.result()
+            comp_news    = {c: f.result() for c, f in comp_news_futures}
+            stock_dfs    = {t: f.result() for t, f in stock_futures}
+            financials   = {t: f.result() for t, f in fin_futures}
 
-        st.divider()
+    company_fin    = financials.get(ticker_map.get(company, ""), {})
+    news_headlines = " | ".join([a["title"] for a in company_news[:6]])
+    comp_headlines = "\n".join([
+        f"{c}: {' | '.join([a['title'] for a in articles[:3]])}"
+        for c, articles in comp_news.items()
+    ])
+    trend_df      = trend_dfs.get(company, pd.DataFrame())
+    trend_summary = (
+        f"{company}: avg={trend_df['value'].mean():.1f}, peak={trend_df['value'].max()}"
+        if not trend_df.empty else ""
+    )
+    comp_trends = "\n".join([
+        f"{kw}: avg={df['value'].mean():.1f}, peak={df['value'].max()}"
+        for kw, df in trend_dfs.items() if kw != company and not df.empty
+    ])
+    fin_summary = (
+        f"Market Cap: ${company_fin.get('market_cap',0)/1e9:.1f}B, "
+        f"TTM Revenue: ${company_fin.get('revenue_ttm',0)/1e9:.1f}B, "
+        f"Gross Margin: {company_fin.get('gross_margin',0)*100:.1f}%, "
+        f"P/E: {company_fin.get('pe_ratio',0):.1f}, "
+        f"Price: ${company_fin.get('current_price',0):.2f}"
+    ) if company_fin else ""
 
-        st.subheader("📰 Latest News")
-        news_tabs = st.tabs(keywords)
-        for tab, kw in zip(news_tabs, keywords):
-            with tab:
-                articles = news_data.get(kw, [])
-                if not articles:
-                    st.info("No news articles found.")
-                for article in articles:
-                    st.markdown(f"**[{article['title']}]({article['link']})**")
-                    st.caption(f"{article['source']}  ·  {article['date']}")
-                    st.write(article["snippet"])
-                    st.markdown("---")
+    full_context = (
+        f"COMPANY: {company}\n\nNEWS:\n{news_headlines}\n\n"
+        f"COMPETITOR NEWS:\n{comp_headlines}\n\n"
+        f"TRENDS:\n{trend_summary}\n{comp_trends}\n\n"
+        f"FINANCIALS:\n{fin_summary}"
+    )
 
-        st.divider()
+    # Run all agents in parallel
+    with st.spinner("Running AI analysis…"):
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_news    = ex.submit(call_agent, "news_analyst",
+                                  f"Company: {company}\n\nNews:\n{news_headlines}")
+            f_comp    = ex.submit(call_agent, "competitor_analyst",
+                                  f"Company: {company}\nCompetitors: {', '.join(competitors)}\n\n"
+                                  f"Trends:\n{trend_summary}\n{comp_trends}\n\n"
+                                  f"Competitor news:\n{comp_headlines}")
+            f_fin     = ex.submit(call_agent, "financial_analyst",
+                                  f"Company: {company}\nFinancials: {fin_summary}")
+            f_improve = ex.submit(call_agent, "improvement_analyst", full_context)
 
-        st.subheader("🤖 Agent Outputs")
-        with st.expander("📈 TrendAgent",      expanded=False): st.markdown(trend_out)
-        with st.expander("💬 SentimentAgent",  expanded=False): st.markdown(sentiment_out)
-        with st.expander("⚔️ CompetitorAgent", expanded=False): st.markdown(competitor_out)
-        with st.expander("🔮 ForecastAgent",   expanded=False): st.markdown(forecast_out)
+            news_out    = f_news.result()
+            comp_out    = f_comp.result()
+            fin_out     = f_fin.result()
+            improve_out = f_improve.result()
 
-        st.subheader("📋 Intelligence Brief")
-        st.caption(f"Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        st.info(brief)
+    with st.spinner("Synthesizing executive brief…"):
+        brief = call_agent(
+            "synthesizer",
+            f"NewsAnalyst:\n{news_out}\n\nCompetitorAnalyst:\n{comp_out}\n\n"
+            f"FinancialAnalyst:\n{fin_out}\n\nImprovementAnalyst:\n{improve_out}",
+        )
 
-    with tab_sales:
-        if not ticker_map:
-            st.warning(
-                "Could not resolve stock tickers. "
-                "Try publicly listed company names like 'Apple', 'Samsung', 'Nike'."
-            )
-        else:
-            resolved_tickers  = list(ticker_map.values())
-            resolved_keywords = list(ticker_map.keys())
+    generated_at = datetime.now().strftime("%B %d, %Y %H:%M")
 
-            st.subheader("📈 Stock Price (Last 12 Months)")
-            st.plotly_chart(build_stock_chart(resolved_tickers, stock_dfs), use_container_width=True)
+    # ── Render ─────────────────────────────────────────────────────────────────
+    st.title(f"🧠 {company} — Intelligence Dashboard")
+    st.caption(f"Report generated · {generated_at}")
 
-            st.subheader("🏦 Key Financial Metrics")
-            metric_cols = st.columns(len(resolved_tickers))
-            for col, (kw, ticker) in zip(metric_cols, ticker_map.items()):
-                fin = financials.get(ticker, {})
-                if not fin:
-                    col.warning(f"No data for {ticker}")
-                    continue
-                col.markdown(f"**{fin.get('company_name', kw)}** (`{ticker}`)")
-                col.metric("Current Price", f"${fin.get('current_price', 0):.2f}")
-                col.metric("Market Cap",    f"${fin.get('market_cap', 0)/1e9:.1f}B")
-                col.metric("TTM Revenue",   f"${fin.get('revenue_ttm', 0)/1e9:.1f}B")
-                col.metric("Gross Margin",  f"{fin.get('gross_margin', 0)*100:.1f}%")
-                col.metric("P/E Ratio",     f"{fin.get('pe_ratio', 0):.1f}")
-                col.metric("52W High",      f"${fin.get('52w_high', 0):.2f}")
-                col.metric("52W Low",       f"${fin.get('52w_low', 0):.2f}")
+    # PDF download button — top of page for easy access
+    pdf_bytes = generate_pdf(
+        company, competitors, brief, news_out, comp_out,
+        fin_out, improve_out, financials, ticker_map, generated_at,
+    )
+    st.download_button(
+        label="📄 Download Full Report (PDF)",
+        data=pdf_bytes,
+        file_name=f"{company.replace(' ','_')}_Intelligence_Report_{datetime.now().strftime('%Y%m%d')}.pdf",
+        mime="application/pdf",
+        type="primary",
+    )
 
-            st.divider()
+    st.divider()
+    st.subheader("📋 Executive Brief")
+    st.info(brief)
+    st.divider()
 
-            st.subheader("💵 Quarterly Revenue Comparison ($M)")
-            st.plotly_chart(build_revenue_chart(resolved_tickers, financials), use_container_width=True)
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📰 News & Sentiment",
+        "⚔️ Competitor Analysis",
+        "💰 Financials",
+        "🎯 What to Improve",
+    ])
 
-            st.divider()
+    with tab1:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader(f"Latest News — {company}")
+            for article in company_news:
+                st.markdown(f"**[{article['title']}]({article['link']})**")
+                st.caption(f"{article['source']}  ·  {article['date']}")
+                st.write(article["snippet"])
+                st.markdown("---")
+        with col2:
+            st.subheader("AI News Analysis")
+            st.markdown(news_out)
 
-            st.subheader("🏷️ Pricing Signals (Google Shopping)")
-            price_tabs = st.tabs(resolved_keywords)
-            for ptab, kw in zip(price_tabs, resolved_keywords):
-                with ptab:
-                    items = pricing.get(kw, [])
-                    if not items:
-                        st.info("No pricing data found.")
-                    for item in items:
-                        st.markdown(f"**{item['title']}** — `{item['price']}`")
-                        st.caption(item["source"])
+    with tab2:
+        st.subheader("📈 Search Interest vs Competitors")
+        trend_list = [trend_dfs.get(kw, pd.DataFrame()) for kw in all_keywords]
+        if any(not df.empty for df in trend_list):
+            st.plotly_chart(build_trend_chart(all_keywords, trend_list), use_container_width=True)
+        if competitors:
+            st.subheader("Competitor News")
+            comp_tabs = st.tabs(competitors)
+            for ctab, comp in zip(comp_tabs, competitors):
+                with ctab:
+                    for article in comp_news.get(comp, []):
+                        st.markdown(f"**[{article['title']}]({article['link']})**")
+                        st.caption(f"{article['source']}  ·  {article['date']}")
                         st.markdown("---")
+        st.subheader("AI Competitor Analysis")
+        st.markdown(comp_out)
+
+    with tab3:
+        if ticker_map:
+            all_tickers = list(ticker_map.values())
+
+            # Stock price chart
+            st.subheader("📈 Stock Price (Last 12 Months)")
+            st.plotly_chart(build_stock_chart(all_tickers, stock_dfs), use_container_width=True)
 
             st.divider()
 
-            st.subheader("📋 Sales Intelligence Brief")
-            st.caption(f"Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            st.info(sales_brief)
+            # Financial comparison (new)
+            render_financial_comparison(ticker_map, financials)
+
+            st.divider()
+
+            # Quarterly revenue
+            st.subheader("💵 Quarterly Revenue ($M)")
+            st.plotly_chart(build_revenue_chart(all_tickers, financials), use_container_width=True)
+
+            st.subheader("AI Financial Analysis")
+            st.markdown(fin_out)
+        else:
+            st.warning("Could not resolve any stock tickers automatically.")
+
+    with tab4:
+        st.subheader(f"🎯 What {company} Should Improve")
+        st.markdown(improve_out)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# App entry point
+# ══════════════════════════════════════════════════════════════════════════════
+st.set_page_config(
+    page_title="Company Intelligence Dashboard",
+    page_icon="🧠",
+    layout="wide",
+)
+
+# ── Auth gate ──────────────────────────────────────────────────────────────────
+if not st.session_state.get("logged_in"):
+    show_login()
+    st.stop()
+
+settings = load_settings()
+
+# ── Sidebar ────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown(f"👤 **{st.session_state['user_id']}** "
+                f"({'Admin' if is_admin() else 'Employee'})")
+    if st.button("Logout", use_container_width=True):
+        for key in ["logged_in", "user_id", "role", "company_settings"]:
+            st.session_state.pop(key, None)
+        st.rerun()
+
+    st.divider()
+
+    # Only admin sees settings
+    if is_admin():
+        st.title("⚙️ Admin Settings")
+        st.caption("Set once — employees see the report on open.")
+        st.divider()
+
+        company_name = st.text_input(
+            "Company name",
+            value=settings.get("company_name", ""),
+            placeholder="e.g. Nike",
+        )
+        st.caption("Stock ticker is resolved automatically from the company name.")
+
+        st.markdown("**Competitors**")
+        auto_comp = st.checkbox(
+            "Auto-detect competitors",
+            value=settings.get("auto_competitors", True),
+        )
+        manual_competitors = st.text_input(
+            "Or enter manually (comma-separated)",
+            value=", ".join(settings.get("competitors", [])),
+            placeholder="e.g. Adidas, Puma, New Balance",
+            disabled=auto_comp,
+        )
+
+        if st.button("💾 Save & Load Dashboard", type="primary", use_container_width=True):
+            if not company_name.strip():
+                st.error("Please enter a company name.")
+            else:
+                competitors = []
+                if auto_comp:
+                    with st.spinner("Detecting competitors…"):
+                        competitors = auto_detect_competitors(company_name.strip())
+                    if competitors:
+                        st.success(f"Detected: {', '.join(competitors)}")
+                    else:
+                        st.warning("Could not auto-detect. Enter manually.")
+                else:
+                    competitors = [c.strip() for c in manual_competitors.split(",") if c.strip()]
+
+                save_settings({
+                    "company_name":     company_name.strip(),
+                    "company_ticker":   "",      # always auto-resolved now
+                    "competitors":      competitors,
+                    "auto_competitors": auto_comp,
+                })
+                st.rerun()
+
+    if settings.get("company_name"):
+        st.success(f"Tracking: **{settings['company_name']}**")
+        if settings.get("competitors"):
+            st.caption("vs " + ", ".join(settings["competitors"]))
+        if st.button("🔄 Refresh Report", use_container_width=True):
+            st.rerun()
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+if not settings.get("company_name"):
+    st.title("🧠 Company Intelligence Dashboard")
+    st.divider()
+    if is_admin():
+        st.info("👈 Open the sidebar, enter your company name, and click Save & Load Dashboard.")
+    else:
+        st.info("The dashboard is being configured by your admin. Please check back shortly.")
+else:
+    render_dashboard(settings)
