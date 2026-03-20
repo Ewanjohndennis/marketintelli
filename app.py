@@ -182,7 +182,7 @@ def auto_detect_competitors(company_name: str) -> list:
                         "No explanation, no markdown, just the JSON array."},
                     {"role": "user", "content": f"Top 4 competitors of {company_name}"}
                 ],
-                max_tokens=100, temperature=0.3,
+                max_tokens=150, temperature=0.3,
             )
             raw     = response.choices[0].message.content.strip()
             cleaned = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
@@ -198,29 +198,35 @@ AGENTS = {
     "news_analyst":
         "You are NewsAnalyst for an internal company intelligence system. "
         "Analyse the latest news headlines. Summarise key developments, risks, "
-        "and opportunities in 2 short paragraphs. Be direct and actionable.",
+        "and opportunities in 2 short paragraphs. Be direct and actionable."
+        "Be concise. Do not repeat the question. Start your response directly.",
     "competitor_analyst":
         "You are CompetitorAnalyst. Compare the company against its competitors "
         "based on search trends and news. Who is gaining ground? Who is losing? "
-        "What are the key differentiators? 2 short paragraphs.",
+        "What are the key differentiators? 2 short paragraphs."
+        "Be concise. Do not repeat the question. Start your response directly.",
+
     "financial_analyst":
         "You are FinancialAnalyst. Analyse the stock performance and revenue data. "
         "Identify growth trends, risks, and financial health signals. "
-        "Be concise and data-driven. 2 short paragraphs.",
+        "Be concise and data-driven. 2 short paragraphs."
+        "Be concise. Do not repeat the question. Start your response directly.",
     "improvement_analyst":
         "You are StrategicAdvisor. Based on the news, competitor positioning, "
         "trends, and financials, identify 5 specific actionable improvements. "
-        "Format as a numbered list. Be direct and specific.",
+        "Format as a numbered list. Be direct and specific."
+        "Be concise. Do not repeat the question. Start your response directly.",
     "synthesizer":
         "You are the Chief Intelligence Officer. Merge all analyst inputs into "
         "an executive brief with these sections:\n"
         "1. Company Pulse\n2. Competitive Position\n3. Financial Health\n"
         "4. Key Risks\n5. Strategic Recommendations\n"
-        "Be sharp, concise, and executive-ready. Use bullet points.",
+        "Be sharp, concise, and executive-ready. Use bullet points."
+        "Be concise. Do not repeat the question. Start your response directly.",
 }
 
 def call_agent(role: str, message: str, retries: int = 3) -> str:
-    """Call Groq with automatic retry on transient connection errors."""
+    """Call OpenRouter with automatic retry on transient connection errors."""
     import time
     last_err = None
     for attempt in range(retries):
@@ -231,7 +237,7 @@ def call_agent(role: str, message: str, retries: int = 3) -> str:
                     {"role": "system", "content": AGENTS[role]},
                     {"role": "user",   "content": message},
                 ],
-                max_tokens=600, temperature=0.4,
+                max_tokens=1500, temperature=0.4,
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
