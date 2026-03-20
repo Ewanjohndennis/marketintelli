@@ -19,11 +19,16 @@ from reportlab.platypus import (
 )
 load_dotenv()
 # ── Config ─────────────────────────────────────────────────────────────────────
-GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+
 SERP_API_KEY = st.secrets["SERP_API_KEY"]
 MONGO_URI    = st.secrets["MONGO_URI"]
+from openai import OpenAI
+OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
+groq_client = OpenAI(                                 
+    api_key=OPENROUTER_API_KEY,
+    base_url="https://openrouter.ai/api/v1",
+)
 
-groq_client = Groq(api_key=GROQ_API_KEY)
 
 COLORS = [
     ("#4F8EF7", "rgba(79,142,247,0.12)"),
@@ -170,7 +175,7 @@ def auto_detect_competitors(company_name: str) -> list:
     for attempt in range(3):
         try:
             response = groq_client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model="meta-llama/llama-3.1-8b-instruct:free",
                 messages=[
                     {"role": "system", "content":
                         "Return ONLY a JSON array of exactly 4 top competitor company names. "
@@ -221,7 +226,7 @@ def call_agent(role: str, message: str, retries: int = 3) -> str:
     for attempt in range(retries):
         try:
             response = groq_client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model="meta-llama/llama-3.1-8b-instruct:free" ,
                 messages=[
                     {"role": "system", "content": AGENTS[role]},
                     {"role": "user",   "content": message},

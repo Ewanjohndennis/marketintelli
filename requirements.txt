@@ -9,3 +9,4 @@ matplotlib
 groq
 reportlab
 pymongo
+openai
