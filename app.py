@@ -175,7 +175,7 @@ def auto_detect_competitors(company_name: str) -> list:
     for attempt in range(3):
         try:
             response = groq_client.chat.completions.create(
-                model="openai/gpt-5.4-nano",
+               model="nvidia/nemotron-3-nano-30b-a3b:free",
                 messages=[
                     {"role": "system", "content":
                         "Return ONLY a JSON array of exactly 4 top competitor company names. "
@@ -226,7 +226,7 @@ def call_agent(role: str, message: str, retries: int = 3) -> str:
     for attempt in range(retries):
         try:
             response = groq_client.chat.completions.create(
-                model="openai/gpt-5.4-nano" ,
+                model="nvidia/nemotron-3-nano-30b-a3b:free" ,
                 messages=[
                     {"role": "system", "content": AGENTS[role]},
                     {"role": "user",   "content": message},
