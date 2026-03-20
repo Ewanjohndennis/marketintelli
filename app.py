@@ -1,11 +1,13 @@
 import io, json, os, time
+import requests
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+from twelvedata import TDClient
 from concurrent.futures import ThreadPoolExecutor
 from serpapi import GoogleSearch
-from groq import Groq
+from openai import OpenAI
 from datetime import datetime
 from pymongo import MongoClient
 from dotenv import load_dotenv
@@ -20,15 +22,21 @@ from reportlab.platypus import (
 load_dotenv()
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-SERP_API_KEY = st.secrets["SERP_API_KEY"]
-MONGO_URI    = st.secrets["MONGO_URI"]
-from openai import OpenAI
-OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
-groq_client = OpenAI(                                 
+SERP_API_KEY        = st.secrets["SERP_API_KEY"]
+MONGO_URI           = st.secrets["MONGO_URI"]
+OPENROUTER_API_KEY  = st.secrets["OPENROUTER_API_KEY"]
+TWELVE_DATA_API_KEY = st.secrets["TWELVE_DATA_API_KEY"]
+FMP_API_KEY         = st.secrets["FMP_API_KEY"]
+
+groq_client = OpenAI(
     api_key=OPENROUTER_API_KEY,
     base_url="https://openrouter.ai/api/v1",
+    default_headers={
+        "HTTP-Referer": "https://marketintelli.streamlit.app",
+        "X-Title": "Market Intelligence Dashboard",
+    }
 )
-
+td_client = TDClient(apikey=TWELVE_DATA_API_KEY)
 
 COLORS = [
     ("#4F8EF7", "rgba(79,142,247,0.12)"),
@@ -148,34 +156,22 @@ KNOWN_TICKERS = {
 }
 
 def resolve_ticker(keyword: str) -> str | None:
-    """Auto-resolve company name to stock ticker — no manual input needed."""
     key = keyword.lower().strip()
     if key in KNOWN_TICKERS:
         return KNOWN_TICKERS[key]
-    # Try yfinance search
     try:
         results = yf.Search(keyword, max_results=1).quotes
         if results:
-            sym = results[0].get("symbol")
-            if sym:
-                return sym
-    except Exception:
-        pass
-    # Try as raw ticker
-    try:
-        t = yf.Ticker(keyword.upper())
-        if t.info.get("regularMarketPrice") or t.info.get("currentPrice"):
-            return keyword.upper()
+            return results[0].get("symbol")
     except Exception:
         pass
     return None
 
 def auto_detect_competitors(company_name: str) -> list:
-    import time
     for attempt in range(3):
         try:
             response = groq_client.chat.completions.create(
-               model="nvidia/nemotron-3-nano-30b-a3b:free",
+                model="nvidia/nemotron-3-nano-30b-a3b:free",
                 messages=[
                     {"role": "system", "content":
                         "Return ONLY a JSON array of exactly 4 top competitor company names. "
@@ -198,41 +194,39 @@ AGENTS = {
     "news_analyst":
         "You are NewsAnalyst for an internal company intelligence system. "
         "Analyse the latest news headlines. Summarise key developments, risks, "
-        "and opportunities in 2 short paragraphs. Be direct and actionable."
+        "and opportunities in 2 short paragraphs. Be direct and actionable. "
         "Be concise. Do not repeat the question. Start your response directly.",
     "competitor_analyst":
         "You are CompetitorAnalyst. Compare the company against its competitors "
         "based on search trends and news. Who is gaining ground? Who is losing? "
-        "What are the key differentiators? 2 short paragraphs."
+        "What are the key differentiators? 2 short paragraphs. "
         "Be concise. Do not repeat the question. Start your response directly.",
-
     "financial_analyst":
         "You are FinancialAnalyst. Analyse the stock performance and revenue data. "
         "Identify growth trends, risks, and financial health signals. "
-        "Be concise and data-driven. 2 short paragraphs."
+        "Be concise and data-driven. 2 short paragraphs. "
         "Be concise. Do not repeat the question. Start your response directly.",
     "improvement_analyst":
         "You are StrategicAdvisor. Based on the news, competitor positioning, "
         "trends, and financials, identify 5 specific actionable improvements. "
-        "Format as a numbered list. Be direct and specific."
+        "Format as a numbered list. Be direct and specific. "
         "Be concise. Do not repeat the question. Start your response directly.",
     "synthesizer":
         "You are the Chief Intelligence Officer. Merge all analyst inputs into "
         "an executive brief with these sections:\n"
         "1. Company Pulse\n2. Competitive Position\n3. Financial Health\n"
         "4. Key Risks\n5. Strategic Recommendations\n"
-        "Be sharp, concise, and executive-ready. Use bullet points."
+        "Be sharp, concise, and executive-ready. Use bullet points. "
         "Be concise. Do not repeat the question. Start your response directly.",
 }
 
 def call_agent(role: str, message: str, retries: int = 3) -> str:
     """Call OpenRouter with automatic retry on transient connection errors."""
-    import time
     last_err = None
     for attempt in range(retries):
         try:
             response = groq_client.chat.completions.create(
-                model="nvidia/nemotron-3-nano-30b-a3b:free" ,
+                model="nvidia/nemotron-3-nano-30b-a3b:free",
                 messages=[
                     {"role": "system", "content": AGENTS[role]},
                     {"role": "user",   "content": message},
@@ -242,10 +236,8 @@ def call_agent(role: str, message: str, retries: int = 3) -> str:
             return response.choices[0].message.content.strip()
         except Exception as e:
             last_err = e
-            wait = 2 ** attempt  # 1s, 2s, 4s backoff
-            time.sleep(wait)
-    # All retries failed — return a safe fallback message
-    return f"[Analysis unavailable — Groq connection error after {retries} retries: {str(last_err)[:120]}]"
+            time.sleep(2 ** attempt)
+    return f"[Analysis unavailable — OpenRouter error after {retries} retries: {str(last_err)[:120]}]"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Data fetchers
@@ -304,7 +296,7 @@ def fetch_financials(ticker: str) -> dict:
             if rev_row is not None:
                 revenue_series = {
                     str(col.date()): int(val / 1e6)
-                    for col, val in rev_row.items() if pd.notna(val)
+                    for col, val in rev_row.items() if str(val) != "nan"
                 }
         return {
             "ticker":            ticker.upper(),
@@ -410,9 +402,6 @@ def render_financial_comparison(ticker_map: dict, financials: dict):
     """Side-by-side financial metrics comparison table."""
     st.subheader("📊 Financial Metrics Comparison")
 
-    companies = list(ticker_map.keys())
-    tickers   = list(ticker_map.values())
-
     metrics = [
         ("Current Price",    "current_price",   lambda v: f"${v:.2f}"),
         ("Market Cap",       "market_cap",       lambda v: f"${v/1e9:.1f}B"),
@@ -424,11 +413,10 @@ def render_financial_comparison(ticker_map: dict, financials: dict):
         ("Return on Equity", "return_on_equity", lambda v: f"{v*100:.1f}%"),
         ("Debt / Equity",    "debt_to_equity",   lambda v: f"{v:.2f}"),
         ("Dividend Yield",   "dividend_yield",   lambda v: f"{v*100:.2f}%" if v else "N/A"),
-        ("52W High",         "52w_high",         lambda v: f"${v:.2f}"),
-        ("52W Low",          "52w_low",          lambda v: f"${v:.2f}"),
+        ("52W High",         "52w_high",         lambda v: f"${float(v):.2f}"),
+        ("52W Low",          "52w_low",          lambda v: f"${float(v):.2f}"),
     ]
 
-    # Build comparison dataframe
     rows = {}
     for label, key, fmt in metrics:
         row = {}
@@ -445,23 +433,20 @@ def render_financial_comparison(ticker_map: dict, financials: dict):
     df.index.name = "Metric"
     st.dataframe(df, use_container_width=True)
 
-    # Bar chart comparison for key metrics
     st.subheader("📈 Key Metrics — Visual Comparison")
     metric_choice = st.selectbox(
         "Select metric to compare",
         ["Market Cap ($B)", "TTM Revenue ($B)", "Gross Margin (%)",
          "P/E Ratio", "Return on Equity (%)", "Operating Margin (%)"],
     )
-
     metric_map = {
-        "Market Cap ($B)":       ("market_cap",       lambda v: v / 1e9),
-        "TTM Revenue ($B)":      ("revenue_ttm",       lambda v: v / 1e9),
-        "Gross Margin (%)":      ("gross_margin",      lambda v: v * 100),
-        "P/E Ratio":             ("pe_ratio",          lambda v: v),
-        "Return on Equity (%)":  ("return_on_equity",  lambda v: v * 100),
-        "Operating Margin (%)":  ("operating_margin",  lambda v: v * 100),
+        "Market Cap ($B)":      ("market_cap",       lambda v: v / 1e9),
+        "TTM Revenue ($B)":     ("revenue_ttm",      lambda v: v / 1e9),
+        "Gross Margin (%)":     ("gross_margin",     lambda v: v * 100),
+        "P/E Ratio":            ("pe_ratio",         lambda v: v),
+        "Return on Equity (%)": ("return_on_equity", lambda v: v * 100),
+        "Operating Margin (%)": ("operating_margin", lambda v: v * 100),
     }
-
     key, transform = metric_map[metric_choice]
     bar_fig = go.Figure()
     for i, (company, ticker) in enumerate(ticker_map.items()):
@@ -489,47 +474,27 @@ def generate_pdf(company: str, competitors: list, brief: str,
                  news_out: str, comp_out: str, fin_out: str,
                  improve_out: str, financials: dict,
                  ticker_map: dict, generated_at: str) -> bytes:
-    """Generate a professional PDF report using reportlab."""
     buffer = io.BytesIO()
     doc    = SimpleDocTemplate(
         buffer, pagesize=letter,
         leftMargin=0.75*inch, rightMargin=0.75*inch,
         topMargin=0.75*inch, bottomMargin=0.75*inch,
     )
+    styles = getSampleStyleSheet()
+    story  = []
 
-    styles  = getSampleStyleSheet()
-    story   = []
-
-    # Custom styles
-    title_style = ParagraphStyle(
-        "ReportTitle",
-        parent=styles["Title"],
-        fontSize=22, spaceAfter=6, textColor=colors.HexColor("#1a1a2e"),
-    )
-    h1_style = ParagraphStyle(
-        "H1", parent=styles["Heading1"],
-        fontSize=14, spaceAfter=4, spaceBefore=12,
-        textColor=colors.HexColor("#185FA5"),
-    )
-    h2_style = ParagraphStyle(
-        "H2", parent=styles["Heading2"],
-        fontSize=11, spaceAfter=4, spaceBefore=8,
-        textColor=colors.HexColor("#333333"),
-    )
-    body_style = ParagraphStyle(
-        "Body", parent=styles["Normal"],
-        fontSize=10, spaceAfter=6, leading=15,
-    )
-    caption_style = ParagraphStyle(
-        "Caption", parent=styles["Normal"],
-        fontSize=9, textColor=colors.HexColor("#666666"),
-        spaceAfter=12,
-    )
+    title_style = ParagraphStyle("ReportTitle", parent=styles["Title"],
+        fontSize=22, spaceAfter=6, textColor=colors.HexColor("#1a1a2e"))
+    h1_style = ParagraphStyle("H1", parent=styles["Heading1"],
+        fontSize=14, spaceAfter=4, spaceBefore=12, textColor=colors.HexColor("#185FA5"))
+    body_style = ParagraphStyle("Body", parent=styles["Normal"],
+        fontSize=10, spaceAfter=6, leading=15)
+    caption_style = ParagraphStyle("Caption", parent=styles["Normal"],
+        fontSize=9, textColor=colors.HexColor("#666666"), spaceAfter=12)
 
     def add_section(title, content):
         story.append(Paragraph(title, h1_style))
-        story.append(HRFlowable(width="100%", thickness=0.5,
-                                color=colors.HexColor("#185FA5")))
+        story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#185FA5")))
         story.append(Spacer(1, 6))
         for line in content.split("\n"):
             line = line.strip()
@@ -537,30 +502,23 @@ def generate_pdf(company: str, competitors: list, brief: str,
                 story.append(Paragraph(line, body_style))
         story.append(Spacer(1, 10))
 
-    # ── Cover ──────────────────────────────────────────────────────────────────
     story.append(Spacer(1, 0.5*inch))
     story.append(Paragraph(f"{company}", title_style))
     story.append(Paragraph("Intelligence Report", styles["Heading2"]))
     story.append(Spacer(1, 6))
     story.append(Paragraph(f"Generated: {generated_at}", caption_style))
     if competitors:
-        story.append(Paragraph(
-            f"Benchmarked against: {', '.join(competitors)}", caption_style))
-    story.append(HRFlowable(width="100%", thickness=1,
-                            color=colors.HexColor("#185FA5")))
+        story.append(Paragraph(f"Benchmarked against: {', '.join(competitors)}", caption_style))
+    story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#185FA5")))
     story.append(Spacer(1, 0.2*inch))
-
-    # ── Executive Brief ────────────────────────────────────────────────────────
     add_section("Executive Brief", brief)
     story.append(PageBreak())
 
-    # ── Financial Comparison Table ─────────────────────────────────────────────
     story.append(Paragraph("Financial Metrics", h1_style))
-    story.append(HRFlowable(width="100%", thickness=0.5,
-                            color=colors.HexColor("#185FA5")))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#185FA5")))
     story.append(Spacer(1, 8))
 
-    metrics = [
+    pdf_metrics = [
         ("Current Price",    "current_price",   lambda v: f"${v:.2f}"),
         ("Market Cap",       "market_cap",       lambda v: f"${v/1e9:.1f}B"),
         ("TTM Revenue",      "revenue_ttm",      lambda v: f"${v/1e9:.1f}B"),
@@ -569,15 +527,12 @@ def generate_pdf(company: str, competitors: list, brief: str,
         ("P/E Ratio",        "pe_ratio",         lambda v: f"{v:.1f}x"),
         ("EPS",              "eps",              lambda v: f"${v:.2f}"),
         ("Return on Equity", "return_on_equity", lambda v: f"{v*100:.1f}%"),
-        ("52W High",         "52w_high",         lambda v: f"${v:.2f}"),
-        ("52W Low",          "52w_low",          lambda v: f"${v:.2f}"),
+        ("52W High",         "52w_high",         lambda v: f"${float(v):.2f}"),
+        ("52W Low",          "52w_low",          lambda v: f"${float(v):.2f}"),
     ]
-
     company_list = list(ticker_map.keys())
-    header_row   = ["Metric"] + company_list
-    table_data   = [header_row]
-
-    for label, key, fmt in metrics:
+    table_data   = [["Metric"] + company_list]
+    for label, key, fmt in pdf_metrics:
         row = [label]
         for comp in company_list:
             ticker = ticker_map.get(comp, "")
@@ -589,45 +544,39 @@ def generate_pdf(company: str, competitors: list, brief: str,
                 row.append("N/A")
         table_data.append(row)
 
-    col_width = (6.5 * inch) / len(header_row)
-    tbl = Table(table_data, colWidths=[col_width] * len(header_row))
+    col_width = (6.5 * inch) / len(["Metric"] + company_list)
+    tbl = Table(table_data, colWidths=[col_width] * len(["Metric"] + company_list))
     tbl.setStyle(TableStyle([
-        ("BACKGROUND",  (0, 0), (-1, 0),  colors.HexColor("#185FA5")),
-        ("TEXTCOLOR",   (0, 0), (-1, 0),  colors.white),
-        ("FONTNAME",    (0, 0), (-1, 0),  "Helvetica-Bold"),
-        ("FONTSIZE",    (0, 0), (-1, 0),  10),
-        ("ALIGN",       (0, 0), (-1, -1), "CENTER"),
-        ("FONTSIZE",    (0, 1), (-1, -1), 9),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1),
-         [colors.HexColor("#f5f8ff"), colors.white]),
-        ("GRID",        (0, 0), (-1, -1), 0.3, colors.HexColor("#cccccc")),
-        ("LEFTPADDING",  (0, 0), (-1, -1), 6),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-        ("TOPPADDING",   (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING",(0, 0), (-1, -1), 5),
-        ("FONTNAME",    (0, 1), (0, -1), "Helvetica-Bold"),
+        ("BACKGROUND",     (0, 0), (-1, 0),  colors.HexColor("#185FA5")),
+        ("TEXTCOLOR",      (0, 0), (-1, 0),  colors.white),
+        ("FONTNAME",       (0, 0), (-1, 0),  "Helvetica-Bold"),
+        ("FONTSIZE",       (0, 0), (-1, 0),  10),
+        ("ALIGN",          (0, 0), (-1, -1), "CENTER"),
+        ("FONTSIZE",       (0, 1), (-1, -1), 9),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#f5f8ff"), colors.white]),
+        ("GRID",           (0, 0), (-1, -1), 0.3, colors.HexColor("#cccccc")),
+        ("LEFTPADDING",    (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING",   (0, 0), (-1, -1), 6),
+        ("TOPPADDING",     (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING",  (0, 0), (-1, -1), 5),
+        ("FONTNAME",       (0, 1), (0, -1),  "Helvetica-Bold"),
     ]))
     story.append(tbl)
     story.append(Spacer(1, 16))
     story.append(PageBreak())
 
-    # ── Analysis sections ──────────────────────────────────────────────────────
     add_section("News & Sentiment Analysis", news_out)
     add_section("Competitor Analysis",       comp_out)
     add_section("Financial Analysis",        fin_out)
     story.append(PageBreak())
-    add_section("Strategic Recommendations — What to Improve", improve_out)
-
-    # ── Footer note ────────────────────────────────────────────────────────────
+    add_section("Strategic Recommendations", improve_out)
     story.append(Spacer(1, 0.3*inch))
-    story.append(HRFlowable(width="100%", thickness=0.5,
-                            color=colors.HexColor("#cccccc")))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#cccccc")))
     story.append(Paragraph(
-        "This report was auto-generated by the Company Intelligence Dashboard. "
-        "Data sourced from Google Trends, Google News, and Yahoo Finance.",
+        "Auto-generated by Company Intelligence Dashboard. "
+        "Data sourced from Google Trends, Google News, Twelve Data, and FMP.",
         caption_style,
     ))
-
     doc.build(story)
     buffer.seek(0)
     return buffer.read()
@@ -641,7 +590,6 @@ def render_dashboard(settings: dict):
     all_keywords = [company] + competitors
     ticker_map   = {}
 
-    # Auto-resolve all tickers
     with st.spinner("Resolving tickers automatically…"):
         t = resolve_ticker(company)
         if t:
@@ -656,7 +604,6 @@ def render_dashboard(settings: dict):
             "Tickers: " + ", ".join([f"{k} → `{v}`" for k, v in ticker_map.items()])
         )
 
-    # Fetch all data in parallel
     with st.spinner("Gathering intelligence…"):
         with ThreadPoolExecutor(max_workers=16) as ex:
             trend_futures     = [(kw, ex.submit(fetch_trend, kw)) for kw in all_keywords]
@@ -701,7 +648,6 @@ def render_dashboard(settings: dict):
         f"FINANCIALS:\n{fin_summary}"
     )
 
-    # Run all agents in parallel
     with st.spinner("Running AI analysis…"):
         with ThreadPoolExecutor(max_workers=2) as ex:
             f_news    = ex.submit(call_agent, "news_analyst",
@@ -728,11 +674,9 @@ def render_dashboard(settings: dict):
 
     generated_at = datetime.now().strftime("%B %d, %Y %H:%M")
 
-    # ── Render ─────────────────────────────────────────────────────────────────
     st.title(f"🧠 {company} — Intelligence Dashboard")
     st.caption(f"Report generated · {generated_at}")
 
-    # PDF download button — top of page for easy access
     pdf_bytes = generate_pdf(
         company, competitors, brief, news_out, comp_out,
         fin_out, improve_out, financials, ticker_map, generated_at,
@@ -790,22 +734,13 @@ def render_dashboard(settings: dict):
     with tab3:
         if ticker_map:
             all_tickers = list(ticker_map.values())
-
-            # Stock price chart
             st.subheader("📈 Stock Price (Last 12 Months)")
             st.plotly_chart(build_stock_chart(all_tickers, stock_dfs), use_container_width=True)
-
             st.divider()
-
-            # Financial comparison (new)
             render_financial_comparison(ticker_map, financials)
-
             st.divider()
-
-            # Quarterly revenue
             st.subheader("💵 Quarterly Revenue ($M)")
             st.plotly_chart(build_revenue_chart(all_tickers, financials), use_container_width=True)
-
             st.subheader("AI Financial Analysis")
             st.markdown(fin_out)
         else:
@@ -825,14 +760,12 @@ st.set_page_config(
     layout="wide",
 )
 
-# ── Auth gate ──────────────────────────────────────────────────────────────────
 if not st.session_state.get("logged_in"):
     show_login()
     st.stop()
 
 settings = load_settings()
 
-# ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown(f"👤 **{st.session_state['user_id']}** "
                 f"({'Admin' if is_admin() else 'Employee'})")
@@ -843,7 +776,6 @@ with st.sidebar:
 
     st.divider()
 
-    # Only admin sees settings
     if is_admin():
         st.title("⚙️ Admin Settings")
         st.caption("Set once — employees see the report on open.")
@@ -885,7 +817,7 @@ with st.sidebar:
 
                 save_settings({
                     "company_name":     company_name.strip(),
-                    "company_ticker":   "",      # always auto-resolved now
+                    "company_ticker":   "",
                     "competitors":      competitors,
                     "auto_competitors": auto_comp,
                 })
@@ -898,7 +830,6 @@ with st.sidebar:
         if st.button("🔄 Refresh Report", use_container_width=True):
             st.rerun()
 
-# ── Main ───────────────────────────────────────────────────────────────────────
 if not settings.get("company_name"):
     st.title("🧠 Company Intelligence Dashboard")
     st.divider()

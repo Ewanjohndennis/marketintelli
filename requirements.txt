@@ -10,3 +10,5 @@ groq
 reportlab
 pymongo
 openai
+twelvedata
+requests
