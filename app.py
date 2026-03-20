@@ -1,10 +1,8 @@
 import io, json, os, time
-import requests
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
-from twelvedata import TDClient
 from concurrent.futures import ThreadPoolExecutor
 from serpapi import GoogleSearch
 from openai import OpenAI
@@ -20,13 +18,16 @@ from reportlab.platypus import (
     TableStyle, HRFlowable, PageBreak,
 )
 load_dotenv()
-# ── Config ─────────────────────────────────────────────────────────────────────
 
-SERP_API_KEY        = st.secrets["SERP_API_KEY"]
-MONGO_URI           = st.secrets["MONGO_URI"]
-OPENROUTER_API_KEY  = st.secrets["OPENROUTER_API_KEY"]
-TWELVE_DATA_API_KEY = st.secrets["TWELVE_DATA_API_KEY"]
-FMP_API_KEY         = st.secrets["FMP_API_KEY"]
+# ── yfinance crumb fix — must be set before any yfinance calls ─────────────────
+import requests as _requests
+_YF_SESSION = _requests.Session()
+_YF_SESSION.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+SERP_API_KEY       = st.secrets["SERP_API_KEY"]
+MONGO_URI          = st.secrets["MONGO_URI"]
+OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
 
 groq_client = OpenAI(
     api_key=OPENROUTER_API_KEY,
@@ -36,7 +37,6 @@ groq_client = OpenAI(
         "X-Title": "Market Intelligence Dashboard",
     }
 )
-td_client = TDClient(apikey=TWELVE_DATA_API_KEY)
 
 COLORS = [
     ("#4F8EF7", "rgba(79,142,247,0.12)"),
@@ -92,10 +92,6 @@ def is_admin() -> bool:
 CONFIG_DOC_ID = "global_company_config"
 
 def load_settings() -> dict:
-    """
-    Read company config from MongoDB.
-    Always fetches fresh from DB so employees see admin changes immediately.
-    """
     try:
         db  = get_db()
         doc = db["config"].find_one({"_id": CONFIG_DOC_ID})
@@ -116,11 +112,6 @@ def load_settings() -> dict:
     }
 
 def save_settings(s: dict):
-    """
-    Write company config to MongoDB.
-    Uses upsert — creates on first save, updates on subsequent saves.
-    All employees read this fresh on every page load.
-    """
     try:
         db = get_db()
         db["config"].update_one(
@@ -277,8 +268,10 @@ def fetch_news(keyword: str, num: int = 6) -> list:
         return []
 
 def fetch_stock_price(ticker: str) -> pd.DataFrame:
+    """Fetch 12 months daily price via yfinance with session crumb fix."""
     try:
-        df = yf.Ticker(ticker).history(period="1y")[["Close"]].reset_index()
+        t  = yf.Ticker(ticker, session=_YF_SESSION)
+        df = t.history(period="1y")[["Close"]].reset_index()
         df.columns = ["date", "price"]
         df["date"] = df["date"].dt.strftime("%Y-%m-%d")
         return df
@@ -286,8 +279,9 @@ def fetch_stock_price(ticker: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 def fetch_financials(ticker: str) -> dict:
+    """Fetch key financials via yfinance with session crumb fix."""
     try:
-        t     = yf.Ticker(ticker)
+        t     = yf.Ticker(ticker, session=_YF_SESSION)
         info  = t.info
         q_fin = t.quarterly_financials
         revenue_series = {}
@@ -399,9 +393,7 @@ def build_revenue_chart(tickers, financials):
 # 3. FINANCIAL COMPARISON TABLE
 # ══════════════════════════════════════════════════════════════════════════════
 def render_financial_comparison(ticker_map: dict, financials: dict):
-    """Side-by-side financial metrics comparison table."""
     st.subheader("📊 Financial Metrics Comparison")
-
     metrics = [
         ("Current Price",    "current_price",   lambda v: f"${v:.2f}"),
         ("Market Cap",       "market_cap",       lambda v: f"${v/1e9:.1f}B"),
@@ -416,7 +408,6 @@ def render_financial_comparison(ticker_map: dict, financials: dict):
         ("52W High",         "52w_high",         lambda v: f"${float(v):.2f}"),
         ("52W Low",          "52w_low",          lambda v: f"${float(v):.2f}"),
     ]
-
     rows = {}
     for label, key, fmt in metrics:
         row = {}
@@ -428,10 +419,9 @@ def render_financial_comparison(ticker_map: dict, financials: dict):
             except Exception:
                 row[company] = "N/A"
         rows[label] = row
-
     df = pd.DataFrame(rows).T
     df.index.name = "Metric"
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df, width="stretch")
 
     st.subheader("📈 Key Metrics — Visual Comparison")
     metric_choice = st.selectbox(
@@ -465,7 +455,7 @@ def render_financial_comparison(ticker_map: dict, financials: dict):
         showlegend=False,
         margin=dict(l=50, r=20, t=20, b=40),
     )
-    st.plotly_chart(bar_fig, use_container_width=True)
+    st.plotly_chart(bar_fig, width="stretch")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. PDF REPORT GENERATOR
@@ -482,7 +472,6 @@ def generate_pdf(company: str, competitors: list, brief: str,
     )
     styles = getSampleStyleSheet()
     story  = []
-
     title_style = ParagraphStyle("ReportTitle", parent=styles["Title"],
         fontSize=22, spaceAfter=6, textColor=colors.HexColor("#1a1a2e"))
     h1_style = ParagraphStyle("H1", parent=styles["Heading1"],
@@ -517,7 +506,6 @@ def generate_pdf(company: str, competitors: list, brief: str,
     story.append(Paragraph("Financial Metrics", h1_style))
     story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#185FA5")))
     story.append(Spacer(1, 8))
-
     pdf_metrics = [
         ("Current Price",    "current_price",   lambda v: f"${v:.2f}"),
         ("Market Cap",       "market_cap",       lambda v: f"${v/1e9:.1f}B"),
@@ -543,7 +531,6 @@ def generate_pdf(company: str, competitors: list, brief: str,
             except Exception:
                 row.append("N/A")
         table_data.append(row)
-
     col_width = (6.5 * inch) / len(["Metric"] + company_list)
     tbl = Table(table_data, colWidths=[col_width] * len(["Metric"] + company_list))
     tbl.setStyle(TableStyle([
@@ -564,7 +551,6 @@ def generate_pdf(company: str, competitors: list, brief: str,
     story.append(tbl)
     story.append(Spacer(1, 16))
     story.append(PageBreak())
-
     add_section("News & Sentiment Analysis", news_out)
     add_section("Competitor Analysis",       comp_out)
     add_section("Financial Analysis",        fin_out)
@@ -574,7 +560,7 @@ def generate_pdf(company: str, competitors: list, brief: str,
     story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#cccccc")))
     story.append(Paragraph(
         "Auto-generated by Company Intelligence Dashboard. "
-        "Data sourced from Google Trends, Google News, Twelve Data, and FMP.",
+        "Data sourced from Google Trends, Google News, and Yahoo Finance.",
         caption_style,
     ))
     doc.build(story)
@@ -718,7 +704,7 @@ def render_dashboard(settings: dict):
         st.subheader("📈 Search Interest vs Competitors")
         trend_list = [trend_dfs.get(kw, pd.DataFrame()) for kw in all_keywords]
         if any(not df.empty for df in trend_list):
-            st.plotly_chart(build_trend_chart(all_keywords, trend_list), use_container_width=True)
+            st.plotly_chart(build_trend_chart(all_keywords, trend_list), width="stretch")
         if competitors:
             st.subheader("Competitor News")
             comp_tabs = st.tabs(competitors)
@@ -735,12 +721,12 @@ def render_dashboard(settings: dict):
         if ticker_map:
             all_tickers = list(ticker_map.values())
             st.subheader("📈 Stock Price (Last 12 Months)")
-            st.plotly_chart(build_stock_chart(all_tickers, stock_dfs), use_container_width=True)
+            st.plotly_chart(build_stock_chart(all_tickers, stock_dfs), width="stretch")
             st.divider()
             render_financial_comparison(ticker_map, financials)
             st.divider()
             st.subheader("💵 Quarterly Revenue ($M)")
-            st.plotly_chart(build_revenue_chart(all_tickers, financials), use_container_width=True)
+            st.plotly_chart(build_revenue_chart(all_tickers, financials), width="stretch")
             st.subheader("AI Financial Analysis")
             st.markdown(fin_out)
         else:
