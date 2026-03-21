@@ -5,7 +5,7 @@ import streamlit as st
 import yfinance as yf
 from concurrent.futures import ThreadPoolExecutor
 from serpapi import GoogleSearch
-from openai import OpenAI
+from huggingface_hub import InferenceClient
 from datetime import datetime
 from pymongo import MongoClient
 from dotenv import load_dotenv
@@ -25,17 +25,13 @@ _YF_SESSION = _requests.Session()
 _YF_SESSION.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-SERP_API_KEY       = st.secrets["SERP_API_KEY"]
-MONGO_URI          = st.secrets["MONGO_URI"]
-OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
+SERP_API_KEY = st.secrets["SERP_API_KEY"]
+MONGO_URI    = st.secrets["MONGO_URI"]
+HF_TOKEN     = st.secrets["HF_TOKEN"]
 
-groq_client = OpenAI(
-    api_key=OPENROUTER_API_KEY,
-    base_url="https://openrouter.ai/api/v1",
-    default_headers={
-        "HTTP-Referer": "https://marketintelli.streamlit.app",
-        "X-Title": "Market Intelligence Dashboard",
-    }
+groq_client = InferenceClient(
+    model="openai/gpt-oss-20b",
+    token=HF_TOKEN,
 )
 
 COLORS = [
@@ -161,15 +157,14 @@ def resolve_ticker(keyword: str) -> str | None:
 def auto_detect_competitors(company_name: str) -> list:
     for attempt in range(3):
         try:
-            response = groq_client.chat.completions.create(
-                model="nvidia/nemotron-3-nano-30b-a3b:free",
+            response = groq_client.chat_completion(
                 messages=[
                     {"role": "system", "content":
                         "Return ONLY a JSON array of exactly 4 top competitor company names. "
                         "No explanation, no markdown, just the JSON array."},
                     {"role": "user", "content": f"Top 4 competitors of {company_name}"}
                 ],
-                max_tokens=150, temperature=0.3,
+                max_tokens=50, temperature=0.3,
             )
             raw     = response.choices[0].message.content.strip()
             cleaned = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
@@ -197,38 +192,47 @@ AGENTS = {
         "Identify growth trends, risks, and financial health signals. "
         "Be concise and data-driven. 2 short paragraphs. "
         "Be concise. Do not repeat the question. Start your response directly.",
-    "improvement_analyst":
-        "You are StrategicAdvisor. Based on the news, competitor positioning, "
-        "trends, and financials, identify 5 specific actionable improvements. "
-        "Format as a numbered list. Be direct and specific. "
-        "Be concise. Do not repeat the question. Start your response directly.",
     "synthesizer":
         "You are the Chief Intelligence Officer. Merge all analyst inputs into "
         "an executive brief with these sections:\n"
         "1. Company Pulse\n2. Competitive Position\n3. Financial Health\n"
         "4. Key Risks\n5. Strategic Recommendations\n"
         "Be sharp, concise, and executive-ready. Use bullet points. "
+        "IMPORTANT: After the full brief, add exactly this line: ---RECOMMENDATIONS---\n"
+        "Then repeat ONLY the Strategic Recommendations bullet points after it. "
         "Be concise. Do not repeat the question. Start your response directly.",
 }
 
-def call_agent(role: str, message: str, retries: int = 3) -> str:
+def call_agent(role: str, message: str, retries: int = 5) -> str:
     """Call OpenRouter with automatic retry on transient connection errors."""
     last_err = None
     for attempt in range(retries):
         try:
-            response = groq_client.chat.completions.create(
-                model="nvidia/nemotron-3-nano-30b-a3b:free",
+            response = groq_client.chat_completion(
                 messages=[
                     {"role": "system", "content": AGENTS[role]},
                     {"role": "user",   "content": message},
                 ],
-                max_tokens=1500, temperature=0.4,
+                max_tokens=800, temperature=0.4,
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
             last_err = e
-            time.sleep(2 ** attempt)
+            if "429" in str(e):
+                time.sleep(20)
+            else:
+                time.sleep(2 ** attempt)
     return f"[Analysis unavailable — OpenRouter error after {retries} retries: {str(last_err)[:120]}]"
+
+def extract_section(text: str, section_num: int) -> str:
+    """Extract recommendations using the ---RECOMMENDATIONS--- marker."""
+    if "---RECOMMENDATIONS---" in text:
+        parts = text.split("---RECOMMENDATIONS---")
+        return parts[-1].strip()
+    # Fallback — return last 40% of brief which usually contains recommendations
+    lines = text.split("\n")
+    start = int(len(lines) * 0.6)
+    return "\n".join(lines[start:]).strip() or text
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Data fetchers
@@ -269,48 +273,56 @@ def fetch_news(keyword: str, num: int = 6) -> list:
 
 def fetch_stock_price(ticker: str) -> pd.DataFrame:
     """Fetch 12 months daily price via yfinance with session crumb fix."""
-    try:
-        t  = yf.Ticker(ticker, session=_YF_SESSION)
-        df = t.history(period="1y")[["Close"]].reset_index()
-        df.columns = ["date", "price"]
-        df["date"] = df["date"].dt.strftime("%Y-%m-%d")
-        return df
-    except Exception:
-        return pd.DataFrame()
+    for use_session in [True, False]:
+        try:
+            t  = yf.Ticker(ticker, session=_YF_SESSION) if use_session else yf.Ticker(ticker)
+            df = t.history(period="1y")[["Close"]].reset_index()
+            if df.empty:
+                continue
+            df.columns = ["date", "price"]
+            df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+            return df
+        except Exception:
+            continue
+    return pd.DataFrame()
 
 def fetch_financials(ticker: str) -> dict:
     """Fetch key financials via yfinance with session crumb fix."""
-    try:
-        t     = yf.Ticker(ticker, session=_YF_SESSION)
-        info  = t.info
-        q_fin = t.quarterly_financials
-        revenue_series = {}
-        if q_fin is not None and not q_fin.empty:
-            rev_row = q_fin.loc["Total Revenue"] if "Total Revenue" in q_fin.index else None
-            if rev_row is not None:
-                revenue_series = {
-                    str(col.date()): int(val / 1e6)
-                    for col, val in rev_row.items() if str(val) != "nan"
-                }
-        return {
-            "ticker":            ticker.upper(),
-            "company_name":      info.get("longName", ticker),
-            "market_cap":        info.get("marketCap", 0),
-            "revenue_ttm":       info.get("totalRevenue", 0),
-            "gross_margin":      info.get("grossMargins", 0),
-            "pe_ratio":          info.get("trailingPE", 0),
-            "52w_high":          info.get("fiftyTwoWeekHigh", 0),
-            "52w_low":           info.get("fiftyTwoWeekLow", 0),
-            "current_price":     info.get("currentPrice", 0),
-            "revenue_quarterly": revenue_series,
-            "debt_to_equity":    info.get("debtToEquity", 0),
-            "return_on_equity":  info.get("returnOnEquity", 0),
-            "operating_margin":  info.get("operatingMargins", 0),
-            "eps":               info.get("trailingEps", 0),
-            "dividend_yield":    info.get("dividendYield", 0),
-        }
-    except Exception:
-        return {}
+    for use_session in [True, False]:
+        try:
+            t     = yf.Ticker(ticker, session=_YF_SESSION) if use_session else yf.Ticker(ticker)
+            info  = t.info
+            if not info or not info.get("longName"):
+                continue
+            q_fin = t.quarterly_financials
+            revenue_series = {}
+            if q_fin is not None and not q_fin.empty:
+                rev_row = q_fin.loc["Total Revenue"] if "Total Revenue" in q_fin.index else None
+                if rev_row is not None:
+                    revenue_series = {
+                        str(col.date()): int(val / 1e6)
+                        for col, val in rev_row.items() if str(val) != "nan"
+                    }
+            return {
+                "ticker":            ticker.upper(),
+                "company_name":      info.get("longName", ticker),
+                "market_cap":        info.get("marketCap", 0),
+                "revenue_ttm":       info.get("totalRevenue", 0),
+                "gross_margin":      info.get("grossMargins", 0),
+                "pe_ratio":          info.get("trailingPE", 0),
+                "52w_high":          info.get("fiftyTwoWeekHigh", 0),
+                "52w_low":           info.get("fiftyTwoWeekLow", 0),
+                "current_price":     info.get("currentPrice", 0),
+                "revenue_quarterly": revenue_series,
+                "debt_to_equity":    info.get("debtToEquity", 0),
+                "return_on_equity":  info.get("returnOnEquity", 0),
+                "operating_margin":  info.get("operatingMargins", 0),
+                "eps":               info.get("trailingEps", 0),
+                "dividend_yield":    info.get("dividendYield", 0),
+            }
+        except Exception:
+            continue
+    return {}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Chart builders
@@ -421,7 +433,7 @@ def render_financial_comparison(ticker_map: dict, financials: dict):
         rows[label] = row
     df = pd.DataFrame(rows).T
     df.index.name = "Metric"
-    st.dataframe(df, width="stretch")
+    st.dataframe(df, use_container_width=True)
 
     st.subheader("📈 Key Metrics — Visual Comparison")
     metric_choice = st.selectbox(
@@ -455,7 +467,7 @@ def render_financial_comparison(ticker_map: dict, financials: dict):
         showlegend=False,
         margin=dict(l=50, r=20, t=20, b=40),
     )
-    st.plotly_chart(bar_fig, width="stretch")
+    st.plotly_chart(bar_fig, use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. PDF REPORT GENERATOR
@@ -634,29 +646,26 @@ def render_dashboard(settings: dict):
         f"FINANCIALS:\n{fin_summary}"
     )
 
+    # ── 3 agents only — improvement extracted from brief ──────────────────────
     with st.spinner("Running AI analysis…"):
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            f_news    = ex.submit(call_agent, "news_analyst",
-                                  f"Company: {company}\n\nNews:\n{news_headlines}")
-            f_comp    = ex.submit(call_agent, "competitor_analyst",
-                                  f"Company: {company}\nCompetitors: {', '.join(competitors)}\n\n"
-                                  f"Trends:\n{trend_summary}\n{comp_trends}\n\n"
-                                  f"Competitor news:\n{comp_headlines}")
-            f_fin     = ex.submit(call_agent, "financial_analyst",
-                                  f"Company: {company}\nFinancials: {fin_summary}")
-            f_improve = ex.submit(call_agent, "improvement_analyst", full_context)
-
-            news_out    = f_news.result()
-            comp_out    = f_comp.result()
-            fin_out     = f_fin.result()
-            improve_out = f_improve.result()
+        news_out = call_agent("news_analyst",
+                              f"Company: {company}\n\nNews:\n{news_headlines}")
+        comp_out = call_agent("competitor_analyst",
+                              f"Company: {company}\nCompetitors: {', '.join(competitors)}\n\n"
+                              f"Trends:\n{trend_summary}\n{comp_trends}\n\n"
+                              f"Competitor news:\n{comp_headlines}")
+        fin_out  = call_agent("financial_analyst",
+                              f"Company: {company}\nFinancials: {fin_summary}")
 
     with st.spinner("Synthesizing executive brief…"):
         brief = call_agent(
             "synthesizer",
             f"NewsAnalyst:\n{news_out}\n\nCompetitorAnalyst:\n{comp_out}\n\n"
-            f"FinancialAnalyst:\n{fin_out}\n\nImprovementAnalyst:\n{improve_out}",
+            f"FinancialAnalyst:\n{fin_out}\n\nContext:\n{full_context}",
         )
+
+    # Extract section 5 (Strategic Recommendations) for the improve tab
+    improve_out = extract_section(brief, 5)
 
     generated_at = datetime.now().strftime("%B %d, %Y %H:%M")
 
@@ -704,7 +713,7 @@ def render_dashboard(settings: dict):
         st.subheader("📈 Search Interest vs Competitors")
         trend_list = [trend_dfs.get(kw, pd.DataFrame()) for kw in all_keywords]
         if any(not df.empty for df in trend_list):
-            st.plotly_chart(build_trend_chart(all_keywords, trend_list), width="stretch")
+            st.plotly_chart(build_trend_chart(all_keywords, trend_list), use_container_width=True)
         if competitors:
             st.subheader("Competitor News")
             comp_tabs = st.tabs(competitors)
@@ -721,12 +730,12 @@ def render_dashboard(settings: dict):
         if ticker_map:
             all_tickers = list(ticker_map.values())
             st.subheader("📈 Stock Price (Last 12 Months)")
-            st.plotly_chart(build_stock_chart(all_tickers, stock_dfs), width="stretch")
+            st.plotly_chart(build_stock_chart(all_tickers, stock_dfs), use_container_width=True)
             st.divider()
             render_financial_comparison(ticker_map, financials)
             st.divider()
             st.subheader("💵 Quarterly Revenue ($M)")
-            st.plotly_chart(build_revenue_chart(all_tickers, financials), width="stretch")
+            st.plotly_chart(build_revenue_chart(all_tickers, financials), use_container_width=True)
             st.subheader("AI Financial Analysis")
             st.markdown(fin_out)
         else:
